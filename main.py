@@ -1,9 +1,40 @@
-import json, os, subprocess
+import functools, json, os, re, subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODE = os.environ.get("MODE", "naive")  
 DUMMY = "/app/data/customers.txt"
 TIMEOUT = 10
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+SYSTEM = (
+    "Kamu menulis kode Python 3 yang langsung dijalankan dengan python3 -c. "
+    "Balas HANYA dengan kode, tanpa penjelasan dan tanpa markdown fence. "
+    "Pakai standard library saja dan cetak hasilnya ke stdout."
+)
+FENCE = re.compile(r"^\s*```[\w+-]*\n(.*?)\n?```\s*$", re.S)
+
+
+@functools.cache
+def gemini():
+    from google import genai
+    return genai.Client()
+
+
+def strip_fence(text):
+    m = FENCE.match(text)
+    return (m.group(1) if m else text).strip()
+
+
+def generate(prompt):
+    from google.genai import types
+    r = gemini().models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(system_instruction=SYSTEM, temperature=0.2),
+    )
+    code = strip_fence(r.text or "")
+    print(json.dumps({"severity": "INFO", "message": "gemini code", "mode": MODE, "model": MODEL,
+                      "prompt": prompt, "code": code}), flush=True)
+    return code
 
 
 def run(code):
@@ -37,13 +68,23 @@ class H(BaseHTTPRequestHandler):
         })
 
     def do_POST(self):
-        if self.path != "/execute":
+        if self.path not in ("/execute", "/agent"):
             return self.send(404, {"error": "not found"})
         n = int(self.headers.get("Content-Length", 0))
         if n > 64_000:
-            return self.send(413, {"error": "code too large"})
-        code = self.rfile.read(n).decode()
-        self.send(200, {"mode": MODE, **run(code)})
+            return self.send(413, {"error": "body too large"})
+        body = self.rfile.read(n).decode()
+        if self.path == "/execute":
+            return self.send(200, {"mode": MODE, **run(body)})
+        try:
+            prompt = json.loads(body)["prompt"]
+        except (ValueError, KeyError, TypeError):
+            return self.send(400, {"error": 'body harus {"prompt": "..."}'})
+        try:
+            code = generate(prompt)
+        except Exception as e:
+            return self.send(502, {"error": f"gemini: {e}"})
+        self.send(200, {"mode": MODE, "model": MODEL, "prompt": prompt, "code": code, **run(code)})
 
 
 ThreadingHTTPServer(("", int(os.environ.get("PORT", 8080))), H).serve_forever()
